@@ -1,0 +1,5 @@
+{
+  "name": "EduManage - Sistema de Gestão Escolar",
+  "description": "Sistema para administração de turmas escolares com login de alunos, mural de notícias, carrossel de atividades e painel administrativo para gestão de usuários e envio de comunicados.",
+  "requestFramePermissions": []
+}
