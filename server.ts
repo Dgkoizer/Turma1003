@@ -1,6 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import { Pool } from "pg";
+import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 import multer from "multer";
@@ -8,172 +9,159 @@ import nodemailer from "nodemailer";
 
 // Configuration from environment variables
 const UPLOADS_DIR = process.env.UPLOADS_PATH || path.resolve("uploads");
+const DATABASE_URL = process.env.DATABASE_URL;
 
 // Ensure uploads directory exists
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// PostgreSQL Connection
-if (!process.env.DATABASE_URL) {
-  console.warn("WARNING: DATABASE_URL is not defined. The app will likely fail to connect to the database.");
+// Database Connection Setup
+let pool: Pool | null = null;
+let sqliteDb: any = null;
+const isPostgres = !!DATABASE_URL;
+
+if (isPostgres) {
+  const maskedUrl = DATABASE_URL!.replace(/:[^:@]+@/, ":****@");
+  console.log(`📡 Production Mode: Attempting to connect to PostgreSQL: ${maskedUrl}`);
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: DATABASE_URL?.includes("localhost") ? false : { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000,
+  });
+} else {
+  console.log("🏠 Development Mode: Using local SQLite database.");
+  const DB_PATH = process.env.DATABASE_PATH || "school.db";
+  if (!fs.existsSync(path.dirname(DB_PATH))) {
+    fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  }
+  sqliteDb = new Database(DB_PATH);
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("localhost") ? false : { rejectUnauthorized: false }
-});
+// Helper to execute queries regardless of DB type
+async function query(text: string, params: any[] = []) {
+  if (isPostgres && pool) {
+    const res = await pool.query(text, params);
+    return res;
+  } else {
+    // Convert Postgres $1, $2 syntax to SQLite ? syntax
+    const sqliteSql = text.replace(/\$(\d+)/g, "?");
+    const stmt = sqliteDb.prepare(sqliteSql);
+    if (text.trim().toUpperCase().startsWith("SELECT")) {
+      const rows = stmt.all(...params);
+      return { rows, rowCount: rows.length };
+    } else {
+      const info = stmt.run(...params);
+      return { rows: [], rowCount: info.changes, lastInsertId: info.lastInsertRowid };
+    }
+  }
+}
 
 // Initialize Database
 async function initDb() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        role TEXT DEFAULT 'student',
-        name TEXT
-      );
+  console.log("🚀 Initializing database schema...");
+  
+  const schema = `
+    CREATE TABLE IF NOT EXISTS users (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      email TEXT UNIQUE NOT NULL,
+      role TEXT DEFAULT 'student',
+      name TEXT
+    );
 
-      CREATE TABLE IF NOT EXISTS news (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        content TEXT NOT NULL,
-        image_url TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+    CREATE TABLE IF NOT EXISTS news (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      image_url TEXT,
+      created_at ${isPostgres ? 'TIMESTAMP' : 'DATETIME'} DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS activities (
-        id SERIAL PRIMARY KEY,
-        title TEXT NOT NULL,
-        image_url TEXT NOT NULL,
-        active INTEGER DEFAULT 1
-      );
+    CREATE TABLE IF NOT EXISTS activities (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      title TEXT NOT NULL,
+      image_url TEXT NOT NULL,
+      active INTEGER DEFAULT 1
+    );
 
-      CREATE TABLE IF NOT EXISTS report_cards (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        file_url TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        period TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-      );
+    CREATE TABLE IF NOT EXISTS report_cards (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      user_id INTEGER NOT NULL,
+      file_url TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      period TEXT NOT NULL,
+      created_at ${isPostgres ? 'TIMESTAMP' : 'DATETIME'} DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    );
 
-      CREATE TABLE IF NOT EXISTS polls (
-        id SERIAL PRIMARY KEY,
-        question TEXT NOT NULL,
-        options TEXT NOT NULL, -- JSON array of strings
-        active INTEGER DEFAULT 1,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
+    CREATE TABLE IF NOT EXISTS polls (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      question TEXT NOT NULL,
+      options TEXT NOT NULL,
+      active INTEGER DEFAULT 1,
+      created_at ${isPostgres ? 'TIMESTAMP' : 'DATETIME'} DEFAULT CURRENT_TIMESTAMP
+    );
 
-      CREATE TABLE IF NOT EXISTS votes (
-        id SERIAL PRIMARY KEY,
-        poll_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        option_index INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        CONSTRAINT fk_poll FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE,
-        CONSTRAINT fk_vote_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
-        UNIQUE(poll_id, user_id)
-      );
-    `);
+    CREATE TABLE IF NOT EXISTS votes (
+      id ${isPostgres ? 'SERIAL PRIMARY KEY' : 'INTEGER PRIMARY KEY AUTOINCREMENT'},
+      poll_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      option_index INTEGER NOT NULL,
+      created_at ${isPostgres ? 'TIMESTAMP' : 'DATETIME'} DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (poll_id) REFERENCES polls (id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+      UNIQUE(poll_id, user_id)
+    );
+  `;
 
-    // Seed admin if not exists
-    const adminCheck = await client.query("SELECT * FROM users WHERE role = 'admin' LIMIT 1");
-    if (adminCheck.rows.length === 0) {
-      await client.query("INSERT INTO users (email, role, name) VALUES ($1, $2, $3)", ["admin@escola.com", "admin", "Administrador"]);
+  if (isPostgres) {
+    const client = await pool!.connect();
+    try {
+      await client.query(schema);
+    } finally {
+      client.release();
     }
+  } else {
+    sqliteDb.exec(schema);
+  }
 
-    // Seed random users if empty
-    const userCount = await client.query("SELECT COUNT(*) as count FROM users WHERE role = 'student'");
-    if (parseInt(userCount.rows[0].count) < 10) {
-      console.log("Seeding random users...");
-      const randomUsers = [
-        ["Ana Silva", "ana.silva@escola.com"],
-        ["Bruno Oliveira", "bruno.oliveira@escola.com"],
-        ["Carla Santos", "carla.santos@escola.com"],
-        ["Diego Ferreira", "diego.ferreira@escola.com"],
-        ["Elena Costa", "elena.costa@escola.com"],
-        ["Fabio Rodrigues", "fabio.rodrigues@escola.com"],
-        ["Gisele Almeida", "gisele.almeida@escola.com"],
-        ["Hugo Pereira", "hugo.pereira@escola.com"],
-        ["Isabela Carvalho", "isabela.carvalho@escola.com"],
-        ["João Gomes", "joao.gomes@escola.com"],
-        ["Kelly Martins", "kelly.martins@escola.com"],
-        ["Lucas Lima", "lucas.lima@escola.com"],
-        ["Mariana Rocha", "mariana.rocha@escola.com"],
-        ["Nicolas Souza", "nicolas.souza@escola.com"],
-        ["Olivia Barbosa", "olivia.barbosa@escola.com"],
-        ["Paulo Ribeiro", "paulo.ribeiro@escola.com"],
-        ["Quelita Mendes", "quelita.mendes@escola.com"],
-        ["Ricardo Castro", "ricardo.castro@escola.com"],
-        ["Sabrina Nunes", "sabrina.nunes@escola.com"]
-      ];
+  // Seed admin if not exists
+  const adminCheck = await query("SELECT * FROM users WHERE role = 'admin' LIMIT 1");
+  if (adminCheck.rows.length === 0) {
+    await query("INSERT INTO users (email, role, name) VALUES ($1, $2, $3)", ["admin@escola.com", "admin", "Administrador"]);
+  }
 
-      for (const [name, email] of randomUsers) {
-        try {
-          await client.query("INSERT INTO users (name, email, role) VALUES ($1, $2, 'student')", [name, email]);
-        } catch (e) { /* ignore duplicates */ }
-      }
+  // Seed random users if empty
+  const userCount = await query("SELECT COUNT(*) as count FROM users WHERE role = 'student'");
+  if (parseInt(userCount.rows[0].count) < 10) {
+    console.log("Seeding random users...");
+    const randomUsers = [
+      ["Ana Silva", "ana.silva@escola.com"],
+      ["Bruno Oliveira", "bruno.oliveira@escola.com"],
+      ["Carla Santos", "carla.santos@escola.com"],
+      ["Diego Ferreira", "diego.ferreira@escola.com"],
+      ["Elena Costa", "elena.costa@escola.com"],
+      ["Fabio Rodrigues", "fabio.rodrigues@escola.com"],
+      ["Gisele Almeida", "gisele.almeida@escola.com"],
+      ["Hugo Pereira", "hugo.pereira@escola.com"],
+      ["Isabela Carvalho", "isabela.carvalho@escola.com"],
+      ["João Gomes", "joao.gomes@escola.com"],
+      ["Kelly Martins", "kelly.martins@escola.com"],
+      ["Lucas Lima", "lucas.lima@escola.com"],
+      ["Mariana Rocha", "mariana.rocha@escola.com"],
+      ["Nicolas Souza", "nicolas.souza@escola.com"],
+      ["Olivia Barbosa", "olivia.barbosa@escola.com"],
+      ["Paulo Ribeiro", "paulo.ribeiro@escola.com"],
+      ["Quelita Mendes", "quelita.mendes@escola.com"],
+      ["Ricardo Castro", "ricardo.castro@escola.com"],
+      ["Sabrina Nunes", "sabrina.nunes@escola.com"]
+    ];
+
+    for (const [name, email] of randomUsers) {
+      try {
+        await query("INSERT INTO users (name, email, role) VALUES ($1, $2, 'student')", [name, email]);
+      } catch (e) { /* ignore duplicates */ }
     }
-
-    // Seed News
-    const newsCount = await client.query("SELECT COUNT(*) as count FROM news");
-    if (parseInt(newsCount.rows[0].count) === 0) {
-      const newsData = [
-        [
-          "Grande Final do Torneio Interclasses!",
-          "A emoção tomou conta da nossa escola! Amanhã teremos a grande decisão do campeonato de futsal. Preparem suas torcidas, tragam seus cartazes e venham apoiar seus colegas. O esporte une nossa comunidade e fortalece nossos laços!",
-          "https://images.unsplash.com/photo-1546519638-68e109498ffc?auto=format&fit=crop&q=80&w=1000"
-        ],
-        [
-          "Feira de Ciências 2026",
-          "Nossos alunos estão preparando projetos incríveis para a feira deste ano. Venha prestigiar as inovações e descobertas científicas que serão apresentadas no auditório principal.",
-          "https://images.unsplash.com/photo-1532094349884-543bc11b234d?auto=format&fit=crop&q=80&w=1000"
-        ],
-        [
-          "Workshop de Robótica",
-          "Inscrições abertas para o workshop de robótica básica. Uma oportunidade única para aprender programação e montagem de circuitos de forma prática e divertida.",
-          "https://images.unsplash.com/photo-1581092160562-40aa08e78837?auto=format&fit=crop&q=80&w=1000"
-        ],
-        [
-          "Novo Cardápio da Cantina",
-          "A partir de segunda-feira, teremos novas opções saudáveis e deliciosas em nosso cardápio. Confira as novidades e aproveite uma alimentação equilibrada.",
-          "https://images.unsplash.com/photo-1498837167922-ddd27525d352?auto=format&fit=crop&q=80&w=1000"
-        ]
-      ];
-      for (const [title, content, url] of newsData) {
-        await client.query("INSERT INTO news (title, content, image_url) VALUES ($1, $2, $3)", [title, content, url]);
-      }
-    }
-
-    // Seed Poll
-    const pollCount = await client.query("SELECT COUNT(*) as count FROM polls");
-    if (parseInt(pollCount.rows[0].count) === 0) {
-      await client.query("INSERT INTO polls (question, options) VALUES ($1, $2)", [
-        "Qual deve ser o tema da nossa próxima festa cultural?",
-        JSON.stringify(["Festa das Nações", "Arraiá da Escola", "Noite de Talentos", "Feira Gastronômica"])
-      ]);
-    }
-
-    // Seed Activities
-    const actCount = await client.query("SELECT COUNT(*) as count FROM activities");
-    if (parseInt(actCount.rows[0].count) === 0) {
-      const activities = [
-        ["Abertura dos Jogos: O desfile das turmas marcou o início da nossa jornada esportiva.", "https://images.unsplash.com/photo-1511886929837-354d827aae26?auto=format&fit=crop&q=80&w=1000"],
-        ["Competição de Vôlei: Trabalho em equipe e muita garra nas quadras.", "https://images.unsplash.com/photo-1592656670411-b1553043958f?auto=format&fit=crop&q=80&w=1000"],
-        ["Premiação e Encerramento: Celebrando o esforço de todos os nossos atletas.", "https://images.unsplash.com/photo-1578267153662-c96559bb39ac?auto=format&fit=crop&q=80&w=1000"]
-      ];
-      for (const [title, url] of activities) {
-        await client.query("INSERT INTO activities (title, image_url, active) VALUES ($1, $2, 1)", [title, url]);
-      }
-    }
-
-  } finally {
-    client.release();
   }
 }
 
@@ -197,7 +185,7 @@ const upload = multer({ storage });
 app.post("/api/login", async (req, res) => {
   const { email } = req.body;
   try {
-    const result = await pool.query("SELECT * FROM users WHERE email = $1", [email]);
+    const result = await query("SELECT * FROM users WHERE email = $1", [email]);
     if (result.rows.length > 0) {
       res.json(result.rows[0]);
     } else {
@@ -210,7 +198,7 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/users", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM users ORDER BY name ASC");
+    const result = await query("SELECT * FROM users ORDER BY name ASC");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: "Erro no servidor" });
@@ -220,11 +208,11 @@ app.get("/api/users", async (req, res) => {
 app.post("/api/users", async (req, res) => {
   const { email, name, role } = req.body;
   try {
-    const result = await pool.query(
-      "INSERT INTO users (email, name, role) VALUES ($1, $2, $3) RETURNING *",
+    const result = await query(
+      "INSERT INTO users (email, name, role) VALUES ($1, $2, $3)",
       [email, name, role || 'student']
     );
-    res.json(result.rows[0]);
+    res.json({ email, name, role });
   } catch (e) {
     res.status(400).json({ error: "Email já cadastrado" });
   }
@@ -232,7 +220,7 @@ app.post("/api/users", async (req, res) => {
 
 app.delete("/api/users/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM users WHERE id = $1", [req.params.id]);
+    await query("DELETE FROM users WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Erro ao excluir" });
@@ -241,7 +229,7 @@ app.delete("/api/users/:id", async (req, res) => {
 
 app.get("/api/news", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM news ORDER BY created_at DESC");
+    const result = await query("SELECT * FROM news ORDER BY created_at DESC");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: "Erro no servidor" });
@@ -257,11 +245,11 @@ app.post("/api/news", upload.single("file"), async (req: any, res) => {
   }
 
   try {
-    const result = await pool.query(
-      "INSERT INTO news (title, content, image_url) VALUES ($1, $2, $3) RETURNING *",
+    await query(
+      "INSERT INTO news (title, content, image_url) VALUES ($1, $2, $3)",
       [title, content, finalImageUrl]
     );
-    res.json(result.rows[0]);
+    res.json({ title, content, image_url: finalImageUrl });
   } catch (err) {
     res.status(500).json({ error: "Erro ao salvar notícia" });
   }
@@ -269,7 +257,7 @@ app.post("/api/news", upload.single("file"), async (req: any, res) => {
 
 app.delete("/api/news/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM news WHERE id = $1", [req.params.id]);
+    await query("DELETE FROM news WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Erro ao excluir" });
@@ -278,7 +266,7 @@ app.delete("/api/news/:id", async (req, res) => {
 
 app.get("/api/activities", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM activities WHERE active = 1");
+    const result = await query("SELECT * FROM activities WHERE active = 1");
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: "Erro no servidor" });
@@ -295,18 +283,18 @@ app.post("/api/activities", upload.array("files", 5), async (req: any, res) => {
         const file = req.files[i];
         const finalTitle = req.files.length > 1 ? `${title} (${i + 1})` : title;
         const finalUrl = `/uploads/${file.filename}`;
-        const result = await pool.query(
-          "INSERT INTO activities (title, image_url, active) VALUES ($1, $2, 1) RETURNING *",
+        await query(
+          "INSERT INTO activities (title, image_url, active) VALUES ($1, $2, 1)",
           [finalTitle, finalUrl]
         );
-        results.push(result.rows[0]);
+        results.push({ title: finalTitle, image_url: finalUrl });
       }
     } else if (image_url) {
-      const result = await pool.query(
-        "INSERT INTO activities (title, image_url, active) VALUES ($1, $2, 1) RETURNING *",
+      await query(
+        "INSERT INTO activities (title, image_url, active) VALUES ($1, $2, 1)",
         [title, image_url]
       );
-      results.push(result.rows[0]);
+      results.push({ title, image_url });
     }
     res.json(results);
   } catch (err) {
@@ -316,7 +304,7 @@ app.post("/api/activities", upload.array("files", 5), async (req: any, res) => {
 
 app.delete("/api/activities/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM activities WHERE id = $1", [req.params.id]);
+    await query("DELETE FROM activities WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Erro ao excluir" });
@@ -328,10 +316,10 @@ app.get("/api/report-cards", async (req, res) => {
   const { userId } = req.query;
   try {
     if (userId) {
-      const result = await pool.query("SELECT * FROM report_cards WHERE user_id = $1 ORDER BY period ASC", [userId]);
+      const result = await query("SELECT * FROM report_cards WHERE user_id = $1 ORDER BY period ASC", [userId]);
       res.json(result.rows);
     } else {
-      const result = await pool.query(`
+      const result = await query(`
         SELECT rc.*, u.name as student_name 
         FROM report_cards rc 
         JOIN users u ON rc.user_id = u.id 
@@ -356,11 +344,11 @@ app.post("/api/report-cards", upload.single("file"), async (req: any, res) => {
   const file_name = file.originalname;
 
   try {
-    const result = await pool.query(
-      "INSERT INTO report_cards (user_id, file_url, file_name, period) VALUES ($1, $2, $3, $4) RETURNING *",
+    await query(
+      "INSERT INTO report_cards (user_id, file_url, file_name, period) VALUES ($1, $2, $3, $4)",
       [user_id, file_url, file_name, period]
     );
-    res.json(result.rows[0]);
+    res.json({ user_id, file_url, file_name, period });
   } catch (err) {
     res.status(500).json({ error: "Erro ao salvar boletim" });
   }
@@ -369,7 +357,7 @@ app.post("/api/report-cards", upload.single("file"), async (req: any, res) => {
 app.delete("/api/report-cards/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const result = await pool.query("DELETE FROM report_cards WHERE id = $1", [id]);
+    const result = await query("DELETE FROM report_cards WHERE id = $1", [id]);
     if (result.rowCount && result.rowCount > 0) {
       res.json({ success: true });
     } else {
@@ -384,13 +372,13 @@ app.delete("/api/report-cards/:id", async (req, res) => {
 app.get("/api/polls", async (req, res) => {
   const { userId } = req.query;
   try {
-    const pollsResult = await pool.query("SELECT * FROM polls WHERE active = 1 ORDER BY created_at DESC");
+    const pollsResult = await query("SELECT * FROM polls WHERE active = 1 ORDER BY created_at DESC");
     const polls = pollsResult.rows;
     
     const pollsWithVotes = [];
     for (const poll of polls) {
       const options = JSON.parse(poll.options);
-      const votesResult = await pool.query(
+      const votesResult = await query(
         "SELECT option_index, COUNT(*) as count FROM votes WHERE poll_id = $1 GROUP BY option_index",
         [poll.id]
       );
@@ -403,7 +391,7 @@ app.get("/api/polls", async (req, res) => {
 
       let userVoted = null;
       if (userId) {
-        const userVoteResult = await pool.query(
+        const userVoteResult = await query(
           "SELECT option_index FROM votes WHERE poll_id = $1 AND user_id = $2",
           [poll.id, userId]
         );
@@ -429,11 +417,11 @@ app.get("/api/polls", async (req, res) => {
 app.post("/api/polls", async (req, res) => {
   const { question, options } = req.body;
   try {
-    const result = await pool.query(
-      "INSERT INTO polls (question, options) VALUES ($1, $2) RETURNING *",
+    await query(
+      "INSERT INTO polls (question, options) VALUES ($1, $2)",
       [question, JSON.stringify(options)]
     );
-    res.json({ ...result.rows[0], options });
+    res.json({ question, options });
   } catch (err) {
     res.status(500).json({ error: "Erro ao criar enquete" });
   }
@@ -441,7 +429,7 @@ app.post("/api/polls", async (req, res) => {
 
 app.delete("/api/polls/:id", async (req, res) => {
   try {
-    await pool.query("DELETE FROM polls WHERE id = $1", [req.params.id]);
+    await query("DELETE FROM polls WHERE id = $1", [req.params.id]);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Erro ao excluir" });
@@ -453,7 +441,7 @@ app.post("/api/polls/:id/vote", async (req, res) => {
   const pollId = req.params.id;
 
   try {
-    await pool.query(
+    await query(
       "INSERT INTO votes (poll_id, user_id, option_index) VALUES ($1, $2, $3)",
       [pollId, userId, optionIndex]
     );
