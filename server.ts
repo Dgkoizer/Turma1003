@@ -22,8 +22,15 @@ let sqliteDb: any = null;
 const isPostgres = !!DATABASE_URL;
 
 if (isPostgres) {
+  const isPublic = DATABASE_URL!.includes("proxy.rlwy.net") || DATABASE_URL!.includes("public");
   const maskedUrl = DATABASE_URL!.replace(/:[^:@]+@/, ":****@");
-  console.log(`📡 Production Mode: Attempting to connect to PostgreSQL: ${maskedUrl}`);
+  
+  if (isPublic) {
+    console.warn("⚠️ WARNING: You are using a PUBLIC database URL. This will incur egress fees on Railway.");
+    console.info("💡 Tip: Switch to the private DATABASE_URL in your Railway variables to avoid costs and improve speed.");
+  }
+  
+  console.log(`📡 Production Mode: Attempting to connect to PostgreSQL (${isPublic ? 'PUBLIC' : 'PRIVATE'}): ${maskedUrl}`);
   pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: DATABASE_URL?.includes("localhost") ? false : { rejectUnauthorized: false },
