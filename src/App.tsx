@@ -321,9 +321,9 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-bg-light dark:bg-bg-dark flex flex-col transition-colors duration-500">
+    <div className={`min-h-screen flex flex-col transition-colors duration-500 ${darkMode ? 'bg-[#020617] text-[#f1f5f9]' : 'bg-white text-[#0f172a]'}`}>
       {/* Header */}
-      <header className="bg-surface-light dark:bg-surface-dark border-b border-slate-200 dark:border-white/5 sticky top-0 z-40 transition-colors">
+      <header className={`border-b sticky top-0 z-40 transition-colors ${darkMode ? 'bg-[#0f172a] border-white/5' : 'bg-white border-slate-200'}`}>
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-brand-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-brand-500/20">
